@@ -46,7 +46,7 @@ Linked Service, Dataset, Key Vault 및 네트워크는 고객 환경의 표준 �
 ```text
 function-app/            Python v2 Azure Function 샘플과 단위 테스트
 database/                Control Table 확장 SQL
-docs/                    자동화 옵션 및 PoC 검증 범위
+docs/                    자동화 옵션과 운영 고려사항
 scenarios/               고객이 따라 할 수 있는 시나리오별 구성 가이드
 ```
 
@@ -54,9 +54,6 @@ scenarios/               고객이 따라 할 수 있는 시나리오별 구성 
 
 1. [메타데이터 기반 공통 Pipeline 설계 및 전체 자동화](scenarios/01-metadata-pipeline/README.md)
 2. [Azure Portal Pipeline 이메일 알림 구성](scenarios/02-email-alerting/README.md)
-
-미팅의 추가 검토사항 8개 답변과 이번 범위는
-[PoC 검토사항 답변 및 범위](docs/poc-scope-validation.md)에 정리했습니다.
 
 ## Function 샘플 실행
 

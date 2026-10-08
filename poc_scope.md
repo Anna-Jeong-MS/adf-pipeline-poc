@@ -44,5 +44,5 @@ Monitor를 이용해 Pipeline 성공/실패 이메일 알림도 구성한다.
 - Power BI Semantic Model 재활용 구현
 - SharePoint/AI Search/Foundry 비정형 데이터 연계 구현
 
-추가 검토사항 8개에 대한 답변과 제외 항목의 권장 방향은
-[PoC 검토사항 답변 및 범위](docs/poc-scope-validation.md)를 참고한다.
+추가 검토사항 8개에 대한 답변은 공개 저장소에 포함하지 않는 내부 미팅 로그에
+별도로 정리한다.
