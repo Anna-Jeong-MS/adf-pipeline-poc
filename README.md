@@ -1,8 +1,11 @@
 # Table-specific Oracle to ADLS ADF Pipeline Automation
 
-Oracle Control Table을 기준으로 공통 Pipeline 템플릿을 **테이블마다 독립적인
-Azure Data Factory Pipeline으로 자동 생성·갱신하고 실행을 요청**하는 Azure
-Function 샘플입니다.
+온프레미스 Oracle Control Table을 기준으로 테이블별 신규 행 수를 확인하고,
+임계치를 충족한 테이블의 독립 ADF Pipeline만 생성·실행하는 PoC 저장소입니다.
+
+현재는 **배포 전 목표 아키텍처와 시나리오를 검토하는 단계**입니다. 저장소의
+Function Timer/Oracle Cursor 코드는 이전 PoC 구현이며 목표 구조로 아직 변경되지
+않았습니다. 설계 승인 전에는 기존 코드를 목표 환경에 배포하지 않습니다.
 
 대량 테이블은 Pipeline을 분리하는 것에 더해 Oracle `DynamicRange` 또는 물리
 파티션 병렬 Copy와 `parallelCopies`를 테이블별로 설정합니다.
@@ -10,33 +13,30 @@ Function 샘플입니다.
 ## 목표 아키텍처
 
 ```text
-Oracle ADF_CONTROL_TABLE
-        |
-        +--> Pipeline Sync Timer Function
-        |      +--> PUT pl_copy_<schema>_<table>
-        |
-        +--> Pipeline Run Timer Function
-               +--> POST <pipeline>/createRun
-                       |
-                       +--> GetSourceCount
-                       +--> partitioned CopyToAdls
-                       +--> ValidateRowCount
+공통 ADF Schedule Trigger
+  -> Threshold Dispatcher
+      -> Control Table Keyset Paging via Self-hosted IR
+      -> 테이블별 신규 행 수 확인
+      -> 임계치 충족 테이블만 Claim
+      -> Azure Function
+          -> 테이블 Pipeline Create/Update
+          -> 해당 Pipeline Create Run
+              -> 고정 Watermark 범위 Count/Copy/검증
+              -> 성공 시 Watermark 확정
 ```
 
-ADF Schedule Trigger도 ARM Template으로 Export·배포할 수 있다. 이 샘플은
-메타데이터 기반 Pipeline 동기화와 실행 일정 관리를 한 구성 요소에서 처리하기 위해
-Azure Function Timer Trigger를 선택했다.
+Lookup은 한 번에 최대 5,000행/4MB까지만 반환하므로 Control Table 전체를 한 번에
+읽지 않습니다. 공통 Schedule Trigger 하나가 Dispatcher를 시작하고,
+`CONTROL_ID` Keyset Paging으로 제한 이하의 Metadata Page를 순회합니다.
 
-## 자동화 옵션
+상세 설계: [Lookup Paging Threshold Dispatcher 목표 아키텍처](docs/target-architecture.md)
 
-두 방안을 모두 문서화했습니다.
+## 변경되는 자동화 경계
 
-1. **Function이 Pipeline 생성/갱신과 실행을 모두 담당**
-   - 실행 샘플: [function-app/](function-app/)
-   - 테이블 변경이 잦을 때 권장
-2. **Bicep이 Pipeline을 생성하고 Function은 실행만 담당**
-   - 개념 및 제약: [Function 자동화 옵션](docs/function-automation-options.md)
-   - Git 승인과 IaC 변경 통제가 필수일 때 권장
+1. ADF와 Self-hosted IR이 Oracle Control/Source Data Plane을 담당합니다.
+2. Function은 Oracle에 직접 연결하지 않고 ADF Pipeline 관리 API만 호출합니다.
+3. 테이블별 Trigger 대신 공통 Schedule Trigger 하나를 사용합니다.
+4. Watermark와 Claim Lease로 임계치 판단, 중복 방지, 실패 복구를 제어합니다.
 
 이 저장소에는 인프라 배포 코드를 포함하지 않습니다. Function App, Data Factory,
 Linked Service, Dataset, Key Vault 및 네트워크는 고객 환경의 표준 방식으로
@@ -56,42 +56,12 @@ scenarios/               고객이 따라 할 수 있는 시나리오별 구성 
 1. [메타데이터 기반 Pipeline 생성·실행 요청 자동화](scenarios/01-metadata-pipeline/README.md)
 2. [Azure Portal Pipeline 이메일 알림 구성](scenarios/02-email-alerting/README.md)
 
-## Function 샘플 실행
+## 현재 구현 주의사항
 
-### 필수 조건
-
-- Python 3.10 이상
-- Azure Functions Core Tools v4
-- 기존 Azure Data Factory
-- `ds_oracle_dynamic`, `ds_adls_parquet_dynamic`
-- Oracle Control Table 접속 정보
-- Function Managed Identity의 ADF Pipeline 관리 및 실행 권한
-
-### Control Table 확장
-
-[control-table-extension.sql](database/control-table-extension.sql)을 검토한 뒤 Oracle에
-적용합니다. 기존 테이블은 백업하고 개발 환경에서 먼저 검증하십시오.
-
-### 로컬 테스트
-
-```powershell
-cd function-app
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install pytest
-pytest
-```
-
-로컬 실행 설정은 `local.settings.example.json`을 복사해 사용하되
-`local.settings.json`은 커밋하지 않습니다.
-
-```powershell
-Copy-Item local.settings.example.json local.settings.json
-func start
-```
-
-Azure에서는 `ORACLE_PASSWORD` App Setting에 Key Vault Reference를 사용합니다.
+현재 [Function 샘플](function-app/)과
+[Control Table 확장 SQL](database/control-table-extension.sql)은 이전 Timer/Cursor
+구조입니다. 목표 구조의 SQL, HTTP Function, Dispatcher JSON, Schedule Trigger
+JSON은 아키텍처 승인 후 변경합니다.
 
 ## 대용량 테이블 설정
 
@@ -109,9 +79,9 @@ Pipeline마다 `concurrency: 1`을 적용해 동일 테이블의 동시 실행�
 수백 개 Pipeline을 동시에 시작하지 않도록 실행 그룹 또는 Durable Functions
 배치 오케스트레이션을 운영 설계에 추가해야 합니다.
 
-Control Table이 ADF Lookup의 5,000행/4MB 제한을 넘더라도 Function은 ADF Lookup을
-사용하지 않습니다. Oracle Cursor를 기본 100행씩 읽어 Pipeline을 동기화하고,
-실행 시에는 예정된 행만 제한적으로 Claim합니다.
+Control Table이 Lookup 제한을 넘을 수 있으므로 목표 구조에서는 Lookup을
+`CONTROL_ID` 기준으로 페이지 처리합니다. 한 Page는 기본 200행이며, 페이지
+처리는 자식 Pipeline으로 분리해 ADF의 Until/ForEach 중첩 제한을 피합니다.
 
 ## 제공 범위
 
@@ -122,7 +92,6 @@ Control Table이 ADF Lookup의 5,000행/4MB 제한을 넘더라도 Function은 A
 - 불일치 시 `ROW_COUNT_MISMATCH`
 - Azure Monitor 성공/실패 Alert 발화
 
-이 저장소는 Portal, SQL, Pipeline 구조, Function 설정, KQL 샘플을 포함한 고객
-구성 가이드를 제공합니다. Function 샘플은 Pipeline 생성·갱신과 실행 요청 접수
-까지만 추적하며 최종 실행 결과 기반 재처리와 전역 동시 실행 제한은 구현하지
-않습니다. 대용량 Partition Copy와 함께 고객 환경에서 통합 검증해야 합니다.
+이 저장소는 먼저 목표 아키텍처와 Portal 구성·검증 시나리오를 제공합니다.
+설계 승인 후 코드와 템플릿을 구현하고, 로컬 단위/정적 테스트와 고객 개발 환경의
+Self-hosted IR/Oracle/ADF 통합 검증을 구분해 결과를 기록합니다.

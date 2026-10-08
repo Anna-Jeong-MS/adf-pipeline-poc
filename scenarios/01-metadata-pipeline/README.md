@@ -1,375 +1,353 @@
-# Scenario 01 - 메타데이터 기반 Pipeline 생성·실행 요청 자동화
+# Scenario 01 - Lookup Paging 기반 Threshold Dispatcher
 
-이 문서는 Oracle Control Table의 메타데이터로 동일한 ADF Copy 구조를 반복
-적용하고, Azure Function이 테이블별 Pipeline 생성·갱신과 실행 요청을 자동화하는
-방법을 설명한다. 가능 여부를 판정하는 문서가 아니라 고객이 직접 구성하는
-단계별 가이드다.
+## 1. 목적
 
-## 1.1 Pipeline 설계 아키텍처
+현재 ADF Lookup Activity로 Control Table 전체를 읽는 방식을, Control Table이
+5,000행 또는 4MB를 넘어도 처리할 수 있는 페이지 방식으로 변경한다.
 
-### 1.1.1 권장 구조
+최종 실행 흐름은 다음과 같다.
 
 ```text
-Oracle ADF_CONTROL_TABLE
-  |
-  +-- Pipeline Sync Timer Function
-  |     +-- 활성 행을 Cursor 배치로 조회
-  |     +-- 공통 Pipeline 템플릿에 테이블 설정 적용
-  |     +-- ADF Pipeline Create/Update API
-  |
-  +-- Pipeline Run Timer Function
-        +-- 실행 예정 행을 SKIP LOCKED로 Claim
-        +-- ADF Create Run API
-              |
-              +-- GetSourceCount
-              +-- CopyToAdls
-              +-- ValidateRowCount
-              +-- FailRowCountMismatch
+공통 Schedule Trigger 하나
+  -> Threshold Dispatcher
+      -> Control Table 페이지 조회
+      -> 테이블별 신규 행 수 확인
+      -> 임계치 충족 테이블만 Claim
+      -> Function이 해당 테이블 Pipeline Create/Update
+      -> 해당 테이블 Pipeline만 Create Run
 ```
 
-여기서 **공통 Pipeline**은 하나의 Pipeline이 모든 대량 테이블을 동시에 처리한다는
-뜻이 아니라 모든 테이블에 적용할 활동·파라미터·오류 처리의 표준 템플릿이다.
-Control Table 한 행마다 이 템플릿으로 독립 Pipeline을 만들어 테이블별 재실행,
-동시성 제한, 모니터링을 분리한다.
+이 문서는 배포 전 구성·검증 시나리오다. 현재 Function 코드와 SQL은 아직 이
+구조로 변경되지 않았으므로, 먼저 [목표 아키텍처](../../docs/target-architecture.md)를
+검토하고 승인한다.
 
-### 1.1.2 Lookup 적용 기준
+## 2. 설계 원칙
 
-| 방식 | 적용 기준 | 메타데이터 읽기 |
-|---|---|---|
-| ADF Lookup + ForEach | Control Table 조회 결과가 5,000행/4MB 이내이고 ADF 내부 제어로 충분 | `Lookup.output.value` |
-| Function Cursor 배치 | 제한 초과 가능성 또는 Claim, Backoff, API 호출 제어 필요 | Oracle `fetchmany` |
+1. Schedule Trigger는 공통 Dispatcher용 한 개만 사용한다.
+2. 테이블별 Trigger는 만들지 않는다.
+3. Control Table은 전체 조회하지 않고 `CONTROL_ID` Keyset Paging을 사용한다.
+4. Oracle 연결은 Self-hosted Integration Runtime만 사용한다.
+5. Azure Function은 Oracle을 조회하지 않고 ADF Pipeline 관리 API만 호출한다.
+6. 테이블별 Pipeline은 처음 실행되거나 정의가 바뀔 때 Create/Update한다.
+7. 임계치 미달 행은 계속 대기한다.
+8. 임계치를 충족하면 Claim 시점까지 대기 중인 신규 행 전체를 적재한다.
+9. Watermark는 Pipeline 최종 성공 후에만 전진한다.
 
-ADF Lookup 제한은 원천 테이블 데이터량이 아니라 Control Table 조회 결과에
-적용된다. 테이블이 수백 개여도 결과가 5,000행/4MB 이내이고 별도 Claim 제어가
-필요하지 않다면 Lookup + ForEach를 사용할 수 있다. Pipeline 안의
-`GetSourceCount` Lookup은 `COUNT(*)` 한 행만 반환하므로 이 제한과 무관하다.
-
-Lookup + ForEach로 구성하는 경우:
-
-1. Oracle Control Table Dataset을 만든다.
-2. Lookup Activity의 **First row only**를 해제한다.
-3. Query에 `WHERE IS_ACTIVE = 'Y'`를 적용한다.
-4. ForEach **Items**에 `@activity('LookupControl').output.value`를 설정한다.
-5. ForEach **Batch count**를 Oracle 허용 세션 수 이하로 설정한다.
-6. 행 수와 직렬화된 출력 크기를 운영 임계치로 감시한다.
-
-제한에 가까워지면 `ROW_NUMBER()` 또는 `CONTROL_ID` 범위로 페이지를 나누는 상위
-Until Pipeline을 만들 수 있지만, 페이지 상태·재시도·중복 방지가 복잡해지므로
-이 샘플처럼 Function Cursor로 전환하는 것을 권장한다.
-
-### 1.1.3 사전 준비
+## 3. 사전 준비
 
 - Azure Data Factory
-- Oracle DB와 `ADF_CONTROL_TABLE`
-- ADLS Gen2 대상 Container
+- Oracle에 접근 가능한 Self-hosted IR Host
+- 온프레미스 Oracle Source와 Control Schema
+- ADLS Gen2
+- Azure Function App
 - Azure Key Vault
-- Python Azure Function App
-- ADF와 Function에서 Oracle까지의 사설 네트워크 경로
-- [Control Table 확장 SQL](../../database/control-table-extension.sql)
+- 개발 환경에서 사용할 일반/대량/실패 테스트 테이블
 
-### 1.1.4 Portal에서 Linked Service 구성
+배포 전에 다음 값을 합의한다.
 
-#### Oracle Linked Service
+| 설정 | 시작 권장값 | 조정 기준 |
+|---|---:|---|
+| Dispatcher 주기 | 5분 | 허용 지연과 Oracle 부하 |
+| Lookup page size | 200 | 직렬화 크기와 Activity Payload |
+| Page Worker batchCount | 10 | Oracle Session과 SHIR 처리량 |
+| Claim lease | 30분 | 가장 느린 Table Pipeline 시간보다 길게 |
+| 테이블 Pipeline concurrency | 1 | 동일 테이블 중복 실행 방지 보조 |
 
-1. Azure Portal에서 Data Factory를 열고 **Launch Studio**를 선택한다.
-2. ADF Studio의 **Manage > Linked services > + New**를 선택한다.
-3. **Oracle**을 검색하고 선택한다.
-4. 이름을 `ls_oracle_poc`로 입력한다.
-5. Integration Runtime과 Oracle Host, Port, Service Name을 설정한다.
-6. 인증 정보는 Key Vault Linked Service의 Secret을 참조한다.
-7. **Test connection** 후 **Create**를 선택한다.
+## 4. Portal에서 Self-hosted IR 구성
 
-Self-hosted Integration Runtime을 사용하면 Oracle 네트워크에 접근 가능한 Host에
-설치하고 방화벽에서 필요한 방향의 1521 연결만 허용한다.
+1. ADF Studio에서 **Manage > Integration runtimes > + New**를 선택한다.
+2. **Azure, Self-Hosted**를 선택하고 **Self-Hosted**를 선택한다.
+3. 이름을 `ir_onprem_oracle`로 입력한다.
+4. Oracle에 네트워크로 접근 가능한 Windows Host에 Runtime을 설치한다.
+5. Portal에 표시된 인증 키로 Runtime을 등록한다.
+6. **Nodes**에서 상태가 **Running**인지 확인한다.
+7. Host에서 Oracle 1521과 DNS 해석을 확인한다.
+8. 운영에서는 최소 두 노드와 장애 전환을 검토한다.
 
-#### ADLS Gen2 Linked Service
+## 5. Portal에서 Linked Service 구성
 
-1. **Manage > Linked services > + New**를 선택한다.
-2. **Azure Data Lake Storage Gen2**를 선택한다.
-3. 이름을 `ls_adls_gen2`로 입력한다.
-4. 인증은 **Managed Identity**를 선택한다.
-5. Storage Account를 선택하고 **Test connection**을 실행한다.
-6. Data Factory Identity에 대상 Container 범위의
+### 5.1 Oracle
+
+1. **Manage > Linked services > + New > Oracle**을 선택한다.
+2. 이름을 `ls_oracle_poc`로 입력한다.
+3. **Connect via integration runtime**에서 `ir_onprem_oracle`을 선택한다.
+4. Oracle Host, Port, Service Name을 입력한다.
+5. 암호는 Key Vault Secret으로 참조한다.
+6. Control 계정에 Control Table/Package 권한, Source 계정에 대상 테이블 조회
+   권한만 부여한다.
+7. **Test connection**이 성공하는지 확인한다.
+
+### 5.2 ADLS Gen2
+
+1. **Manage > Linked services > + New > Azure Data Lake Storage Gen2**를 선택한다.
+2. 이름을 `ls_adls_gen2`로 입력한다.
+3. 인증은 **Managed Identity**를 사용한다.
+4. Data Factory Identity에 Container 범위의
    **Storage Blob Data Contributor**를 부여한다.
+5. **Test connection**을 실행한다.
 
-### 1.1.5 파라미터 Dataset 구성
+## 6. Control Table 목표 열
 
-#### Oracle Dataset `ds_oracle_dynamic`
+구현 단계에서 기존 Control Table에 다음 개념을 추가한다.
 
-1. **Author > Datasets > + New dataset > Oracle**을 선택한다.
-2. Linked Service는 `ls_oracle_poc`를 선택한다.
-3. **Parameters**에서 `schemaName`, `tableName` 문자열을 추가한다.
-4. Dataset Connection의 Schema에 `@dataset().schemaName`,
-   Table에 `@dataset().tableName`을 설정한다.
+| 그룹 | 열 | 역할 |
+|---|---|---|
+| 식별 | `CONTROL_ID` | Paging과 상태 갱신의 불변 키 |
+| Source | `SOURCE_SCHEMA`, `SOURCE_TABLE` | 원천 객체 |
+| Pipeline | `PIPELINE_NAME`, `IS_ACTIVE` | 생성 이름과 활성 상태 |
+| Watermark | `WATERMARK_COLUMN`, `WATERMARK_TYPE` | NUMBER 또는 TIMESTAMP |
+| Tie-breaker | `TIE_BREAKER_COLUMN` | TIMESTAMP 동률 행의 숫자 PK |
+| 성공 지점 | `LAST_SUCCESS_*` | 마지막 성공 적재 상한 |
+| 임계치 | `MIN_NEW_ROWS` | 실행에 필요한 최소 신규 행 |
+| Pending | `PENDING_*` | Claim된 고정 적재 범위 |
+| Claim | `DISPATCH_STATUS`, `DISPATCH_BATCH_ID` | 상태와 중복 방지 키 |
+| Lease | `LEASE_EXPIRES_AT_UTC` | 중단된 Claim 복구 |
+| ADF | `LAST_ADF_RUN_ID` | 제출된 실행 추적 |
+| 오류 | `FAILURE_COUNT`, `LAST_ERROR` | Backoff와 진단 |
 
-#### Parquet Dataset `ds_adls_parquet_dynamic`
+Oracle 식별자는 허용 문자와 실제 Dictionary 존재 여부를 검증한다. Control Table에
+임의 SQL 조건을 저장해 Function이나 Pipeline에서 연결하지 않는다.
 
-1. **Author > Datasets > + New dataset > Azure Data Lake Storage Gen2 >
-   Parquet**을 선택한다.
-2. Linked Service는 `ls_adls_gen2`를 선택한다.
-3. `folderPath`, `fileName` 문자열 Parameter를 추가한다.
-4. File path의 Directory와 File에 각각
-   `@dataset().folderPath`, `@dataset().fileName`을 설정한다.
+## 7. ADF Pipeline 구성
 
-### 1.1.6 Control Table 구성
+### 7.1 `pl_threshold_dispatcher`
 
-기존 테이블을 먼저 백업하고 확장 SQL을 개발 DB에 적용한다.
+#### Parameters
 
-```sql
-create table ADF_CONTROL_TABLE_BAK_20261008 as
-select * from ADF_CONTROL_TABLE;
-```
+- `pageSize`: 기본 200
+- `maxPages`: 안전한 최대 반복 수
 
-주요 열:
+#### Variables
 
-| 열 | 용도 |
-|---|---|
-| `SOURCE_SCHEMA`, `SOURCE_TABLE` | 원천 객체 |
-| `TARGET_FOLDER` | ADLS 대상 경로 |
-| `PIPELINE_NAME` | 자동 생성할 Pipeline 이름 |
-| `PARTITION_OPTION` | `None`, `DynamicRange`, `PhysicalPartitionsOfTable` |
-| `PARTITION_COLUMN` | Dynamic Range 정수형 분할 열 |
-| `PARTITION_LOWER_BOUND`, `PARTITION_UPPER_BOUND` | 복사할 키 범위 |
-| `PARALLEL_COPIES` | 테이블 내부 Copy 병렬 수 |
-| `RUN_INTERVAL_MINUTES`, `NEXT_RUN_AT_UTC` | 실행 일정 |
-| `FAILURE_COUNT`, `LAST_ERROR` | 제출 실패 추적 |
+- `scanUpperControlId`
+- `lastControlId`
+- `currentPageCount`
+- `hasMorePages`
 
-일반 테이블 예:
+#### Activity 순서
 
-```sql
-insert into ADF_CONTROL_TABLE (
-  CONTROL_ID, SOURCE_SCHEMA, SOURCE_TABLE, TARGET_FOLDER,
-  IS_ACTIVE, LOAD_ORDER, PARTITION_OPTION, PARALLEL_COPIES,
-  RUN_INTERVAL_MINUTES
-)
-values (
-  1001, 'GS_POC', 'GS_PROJECTS', 'gs_projects',
-  'Y', 10, 'None', 1, 1440
-);
-commit;
-```
+1. **LookupScanUpperControlId**
+   - 실행 시작 시 활성 Control 행의 최대 `CONTROL_ID`를 고정한다.
+2. **UntilControlPages**
+   - `currentPageCount == 0` 또는 상한 도달까지 반복한다.
+3. **LookupControlPage**
+   - `lastControlId < CONTROL_ID <= scanUpperControlId`
+   - `ORDER BY CONTROL_ID`
+   - `pageSize`개만 반환한다.
+4. **IfPageHasRows**
+   - 결과가 있으면 자식 Pipeline을 실행한다.
+5. **ExecuteCheckThresholdPage**
+   - Page Array를 `pl_check_threshold_page` Parameter로 전달한다.
+   - **Wait on completion**을 선택한다.
+6. **SetLastControlId**
+   - 페이지 마지막 행의 `CONTROL_ID`로 갱신한다.
 
-대량 테이블은 먼저 실제 Bound를 구하고 분할 설정을 저장한다.
+ADF는 Until 내부에 ForEach를 직접 중첩할 수 없으므로 테이블 반복은 자식
+Pipeline에 둔다.
 
-```sql
-select min(COST_ID), max(COST_ID)
-from GS_POC.GS_COST_ACTUALS;
+### 7.2 `pl_check_threshold_page`
 
-update ADF_CONTROL_TABLE
-set PARTITION_OPTION = 'DynamicRange',
-    PARTITION_COLUMN = 'COST_ID',
-    PARTITION_LOWER_BOUND = 1,
-    PARTITION_UPPER_BOUND = 10000000,
-    PARALLEL_COPIES = 8
-where SOURCE_SCHEMA = 'GS_POC'
-  and SOURCE_TABLE = 'GS_COST_ACTUALS';
-commit;
-```
+#### Parameter
 
-Oracle Connector 문서상 Bound는 복사할 Partition Column의 최솟값과 최댓값이다.
-신규 키가 Upper Bound를 넘기 전에 갱신하고 Row Count도 동일 범위로 조회한다.
-`PARALLEL_COPIES`는 4부터 시작해 Oracle Session, CPU, I/O를 확인하며 조정한다.
+- `controlRows`: 한 페이지의 Control Metadata Array
 
-### 1.1.7 공통 Pipeline 템플릿
+#### Activity 순서
 
-[Function 샘플](../../function-app/function_app.py)의 `pipeline_resource`가 다음
-공통 구조를 ADF Pipeline JSON으로 만든다.
+1. **ForEachControlRow**
+   - Items: `controlRows`
+   - `isSequential`: false
+   - `batchCount`: 기본 10
+2. **CheckNewRows**
+   - 마지막 성공 Watermark 이후 행을 임계치까지만 읽는다.
+3. **IfThresholdReached**
+   - Count가 `MIN_NEW_ROWS` 이상일 때만 다음 단계로 진행한다.
+4. **ClaimAndFreezeWindow**
+   - Oracle Package를 호출한다.
+   - 다른 Dispatcher가 Claim했는지 다시 확인한다.
+   - 현재 대기 행 전체의 상한 Watermark와 Expected Rows를 고정한다.
+5. **RequestFunctionDispatch**
+   - Managed Identity Web Activity로 Function을 호출한다.
+   - Pipeline 정의와 Run Parameter를 전달한다.
+6. **MarkSubmitted**
+   - Function 응답의 ADF Run ID를 Control Table에 기록한다.
+7. **MarkDispatchFailure**
+   - Function 요청이 실패하면 오류를 기록하고 Lease 복구 대상으로 남긴다.
 
-```json
-{
-  "properties": {
-    "concurrency": 1,
-    "folder": { "name": "generated/table-pipelines" },
-    "activities": [
-      { "name": "GetSourceCount", "type": "Lookup" },
-      { "name": "CopyToAdls", "type": "Copy" },
-      { "name": "ValidateRowCount", "type": "IfCondition" }
-    ],
-    "annotations": ["generated-by-adf-pipeline-manager"]
-  }
-}
-```
+### 7.3 공통 Schedule Trigger
 
-- `GetSourceCount`: Dynamic Range 사용 시 같은 Lower/Upper Bound 조건의
-  `SELECT COUNT(*)` 한 행 조회
-- `CopyToAdls`: Dataset Parameter와 Control Table의 Partition 설정 적용
-- `ValidateRowCount`: Lookup Count와 `CopyToAdls.output.rowsCopied` 비교
-- 불일치: `ROW_COUNT_MISMATCH` 코드로 Fail Activity 실행
-- `concurrency: 1`: 같은 테이블 Pipeline의 동시 실행 제한
+1. ADF Studio **Manage > Triggers > + New**를 선택한다.
+2. 이름을 `trg_threshold_dispatcher`로 입력한다.
+3. Type은 **Schedule**을 선택한다.
+4. Time zone과 5분 시작 주기를 설정한다.
+5. `pl_threshold_dispatcher` 하나만 연결한다.
+6. 개발 검증 중에는 Started가 아닌 Stopped로 배포한다.
+7. 수동 검증 완료 후 **Start**하고 **Publish**한다.
 
-Count와 Copy 사이에 원천 데이터가 변경되면 정상 Copy도 불일치로 판단될 수 있다.
-이 검증은 행 수만 비교하며 컬럼 값의 동일성을 보장하지 않는다. 운영에서는
-Watermark/SCN 또는 적재가 고정된 Partition을 사용해 동일 데이터 시점을 맞춘다.
+Trigger는 Pipeline 내부 엔터티가 아니라 별도 ADF 리소스지만 Factory ARM
+Template으로 Pipeline과 함께 Export/배포할 수 있다. 배포 후에는 명시적으로
+Trigger 상태를 Start해야 한다.
 
-정확한 생성 로직과 Dynamic Range JSON은
-[function_app.py](../../function-app/function_app.py)의 `pipeline_resource`를
-사용한다. 테이블/Schema/Partition 열은 식별자 검증 후 JSON에 반영된다.
+## 8. Function 구성 경계
 
-## 1.2 Pipeline 생성·갱신 및 실행 요청 자동화
+ADF Web Activity는 Function App Authentication의 Entra Audience를 사용해 Managed
+Identity로 호출한다. Function Key만 사용하는 Anonymous 공개 Endpoint는 목표
+구성이 아니다.
 
-### 1.2.1 자동화 방식
+Function은 다음 순서만 수행한다.
 
-두 Timer Function이 역할을 나눈다.
+1. JSON Schema, 숫자 범위, 식별자 검증
+2. 공통 Worker 템플릿으로 테이블 Pipeline Create/Update
+3. `DISPATCH_BATCH_ID` 중복 확인
+4. Storage Ledger에 기존 ADF Run ID가 있으면 기존 결과 반환
+5. 기존 Run이 없으면 고정된 Watermark Parameter로 Create Run
+6. Batch ID와 Pipeline Run ID를 Ledger에 기록하고 응답
 
-| Function | 기본 역할 |
-|---|---|
-| `sync_table_pipelines` | Control Table을 배치 조회해 Pipeline Create/Update |
-| `run_table_pipelines` | 예정 행을 Claim하고 Pipeline Create Run 요청 |
+Function에는 Oracle DSN, 사용자, 암호, Oracle Driver를 두지 않는다.
 
-ADF Schedule Trigger는 Factory ARM Template으로 Export·배포할 수 있고
-`recurrence`도 매개변수화할 수 있다. 이 샘플은 Export 제한 때문이 아니라
-메타데이터 동기화와 실행 일정·Claim을 한 구성 요소에서 관리하기 위해 Function
-Timer를 선택했다. 신규 Control Table 행은 다음 Sync 주기에 Pipeline으로 생성되고,
-`NEXT_RUN_AT_UTC`가 지난 행은 Run Timer가 제한된 개수만 제출한다.
+ADF Create Run과 Ledger 기록 사이에는 분산 Transaction이 없다. Create Run 성공
+직후 Function이 종료되면 중복 ADF Run이 생길 수 있으므로, Worker Pipeline의 첫
+Activity가 Oracle `BEGIN_BATCH_EXECUTION`을 호출해 같은 Batch ID 중 하나만 실제
+Count/Copy를 수행하게 한다.
 
-### 1.2.2 Function App 배포
-
-1. 이 저장소의 [function-app](../../function-app/)을 준비한다.
-2. `requirements.txt`에 있는 Package를 설치하고 `pytest`를 실행한다.
-3. VS Code Azure Functions Extension 또는 조직 CI/CD로 Function App에 배포한다.
-4. Portal에서 Function App의 **Functions**에
-   `sync_table_pipelines`, `run_table_pipelines`가 표시되는지 확인한다.
-5. **Overview > Application Insights**가 연결됐는지 확인한다.
-
-로컬 검증:
-
-```powershell
-cd function-app
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install pytest
-pytest
-```
-
-### 1.2.3 Managed Identity와 권한
-
-1. Function App의 **Settings > Identity > System assigned**를 **On**으로 저장한다.
-2. Data Factory의 **Access control (IAM) > Add role assignment**를 연다.
-3. 다음 관리 작업을 `Actions`에 포함한 조직 Custom Role을 Factory Scope에
-   부여한다.
+## 9. 생성되는 테이블 Pipeline
 
 ```text
-Microsoft.DataFactory/factories/pipelines/read
-Microsoft.DataFactory/factories/pipelines/write
-Microsoft.DataFactory/factories/pipelines/createRun/action
+AcquireBatchExecution
+  -> GetIncrementalSourceCount
+  -> CopyIncrementalRows
+  -> ValidateExpectedAndCopiedRows
+      -> Success: MarkWatermarkSuccess
+      -> Failure: FailRowCountMismatch + MarkRunFailure
 ```
 
-4. Key Vault에서 Function Identity에 Secret Read 권한을 부여한다.
-5. Oracle 계정에는 Control Table 조회·갱신과 대상 테이블 조회 권한만 부여한다.
+- Count와 Copy는 같은 `old < watermark <= new` 조건을 사용한다.
+- TIMESTAMP는 숫자 PK Tie-breaker를 함께 사용한다.
+- Claim 후 유입된 행은 고정된 `new` Watermark보다 크므로 다음 실행으로 남는다.
+- Source Count, Claim Expected Rows, `rowsRead`, `rowsCopied`가 모두 일치해야 한다.
+- 성공할 때만 `LAST_SUCCESS_*`를 `PENDING_*`로 이동한다.
+- 실패하면 기존 성공 Watermark를 유지한다.
 
-### 1.2.4 Function 환경 변수
+## 10. 배포 전 검증 시나리오
 
-Function App의 **Settings > Environment variables > App settings**에서 설정한다.
+### Scenario A - Lookup 제한 이내 회귀
 
-| 이름 | 예시/설명 |
-|---|---|
-| `AZURE_SUBSCRIPTION_ID` | 대상 구독 ID |
-| `ADF_RESOURCE_GROUP` | Factory Resource Group |
-| `ADF_FACTORY_NAME` | Factory 이름 |
-| `ORACLE_DSN` | `<PRIVATE_HOST>:1521/<SERVICE>` |
-| `ORACLE_USER` | Control Table 사용자 |
-| `ORACLE_PASSWORD` | Key Vault Reference |
-| `PIPELINE_SYNC_SCHEDULE` | `0 0 2 * * *` |
-| `PIPELINE_RUN_SCHEDULE` | `0 * * * * *` |
-| `PIPELINE_SYNC_BATCH_SIZE` | `100` |
-| `MANAGEMENT_API_CONCURRENCY` | `8` |
-| `MAX_PIPELINES_PER_SCHEDULE` | `20` |
+1. Control 행 10개를 준비한다.
+2. `pageSize = 200`으로 Dispatcher를 수동 실행한다.
+3. Lookup이 한 페이지를 반환하는지 확인한다.
+4. 기존 Lookup 방식과 동일한 활성 테이블 목록이 처리되는지 비교한다.
 
-설정 저장 후 Function App을 재시작한다. Oracle 연결은 VNet Integration, Private
-DNS, NSG/방화벽을 통해 확인하며 공인 DSN과 암호를 문서나 화면 캡처에 남기지 않는다.
+기대 결과: 누락·중복 없이 10개를 한 페이지에서 확인한다.
 
-### 1.2.5 Pipeline 생성 자동화 확인
+### Scenario B - Lookup 5,000행 초과
 
-1. Function App **Functions > sync_table_pipelines > Code + Test**를 연다.
-2. **Test/Run**으로 한 번 실행한다.
-3. **Monitor**에서 Invocation 상세와 오류가 없는지 확인한다.
-4. ADF Studio **Author > Factory Resources > Pipelines**를 연다.
-5. `generated/table-pipelines` Folder에서 활성 Control 행과 Pipeline을 대조한다.
-6. Sync를 다시 실행해 중복이 생기지 않고 같은 이름이 갱신되는지 확인한다.
+1. 비운영 Control Table에 5,100개 이상의 가상 Metadata 행을 준비한다.
+2. `pageSize = 200`으로 Dispatcher를 실행한다.
+3. 페이지별 행 수가 200 이하인지 확인한다.
+4. 처리된 `CONTROL_ID`의 최소·최대·개수·중복을 검증한다.
 
-Application Insights 예:
+기대 결과: 단일 Lookup은 제한 이하이고 전체 행은 페이지 간 누락·중복 없이 한 번씩
+스캔된다.
 
-```kusto
-traces
-| where timestamp > ago(30m)
-| where message has "Synchronized"
-| order by timestamp desc
-```
+### Scenario C - 임계치 미달
 
-### 1.2.6 Pipeline 실행 요청 확인
+1. 마지막 성공 Watermark 이후 900행을 준비한다.
+2. `MIN_NEW_ROWS = 1000`으로 설정한다.
+3. Dispatcher를 두 번 실행한다.
 
-테스트 행의 실행 시각을 현재로 바꾼다.
+기대 결과: Claim, Function 호출, Create Run이 발생하지 않고 성공 Watermark도
+변경되지 않는다.
 
-```sql
-update ADF_CONTROL_TABLE
-set NEXT_RUN_AT_UTC = systimestamp
-where SOURCE_SCHEMA = 'GS_POC'
-  and SOURCE_TABLE = 'GS_PROJECTS';
-commit;
-```
+### Scenario D - 임계치 충족
 
-1. **Functions > run_table_pipelines > Code + Test > Test/Run**을 실행한다.
-2. Function **Monitor**에서 Pipeline 이름과 Run ID를 기록한다.
-3. ADF Studio **Monitor > Pipeline runs**에서 같은 Run ID를 검색한다.
-4. 각 Activity의 Input/Output에서 Dataset Parameter, `rowsCopied`, Count를 확인한다.
-5. Control Table의 `LAST_RUN_ID`, `LAST_DISPATCH_AT_UTC`,
-   `NEXT_RUN_AT_UTC`, `FAILURE_COUNT`, `LAST_ERROR`를 확인한다.
+1. 마지막 성공 Watermark 이후 7,500행을 준비한다.
+2. `MIN_NEW_ROWS = 1000`으로 설정한다.
+3. Dispatcher를 실행한다.
 
-### 1.2.7 수백 테이블 배치와 실패 처리
+기대 결과:
 
-- Run Timer 한 번에는 `MAX_PIPELINES_PER_SCHEDULE`개만 Claim한다.
-- 다음 Timer 호출이 남은 예정 행을 이어서 처리한다.
-- ARM 429/일시적 5xx는 `Retry-After` 또는 제한된 Backoff로 재시도한다.
-- 제출 실패는 `FAILURE_COUNT`, `LAST_ERROR`에 기록하고 최대 60분 Backoff한다.
-- 전체 동시 실행 수를 완료 기준으로 엄격히 제한하려면 Durable Functions에서
-  Batch 완료를 기다린 후 다음 Batch를 제출하도록 확장한다.
+- 해당 테이블만 Claim된다.
+- Pending 범위는 7,500행 전체를 포함한다.
+- Function이 테이블 Pipeline을 Create/Update하고 Create Run한다.
+- 성공 후 Watermark가 Claim 상한으로 이동한다.
 
-현재 구현의 정확한 범위:
+### Scenario E - Claim 이후 신규 행 유입
 
-- `LAST_RUN_ID`는 Create Run API가 요청을 접수한 Run ID이며 최종 성공 기록이 아니다.
-- 실행 제출 실패는 Backoff하지만 제출 후 Pipeline 실패를 추적·재처리하지 않는다.
-- `MAX_PIPELINES_PER_SCHEDULE`은 Timer 한 번의 제출 수이며 전역 동시 실행 상한이 아니다.
-- `concurrency: 1`은 동시 실행을 제한하지만 중복 요청 자체를 제거하지 않는다.
-- Claim 직후 Host가 종료되면 해당 회차가 지연될 수 있으므로 엄격한 복구에는
-  Dispatch 상태와 Lease가 필요하다.
+1. 7,500행을 Claim한다.
+2. Copy 실행 중 300행을 추가한다.
+3. 첫 Pipeline 완료 후 Dispatcher를 다시 실행한다.
 
-### 1.2.8 Git Mode와 Live Mode 운영
+기대 결과: 첫 실행은 7,500행만 적재하고 300행은 다음 임계치 판단 대상으로 남는다.
 
-1. 사람이 작성하는 Linked Service/Dataset 등은 개발 Factory의 Git Mode에서
-   Feature Branch와 Pull Request로 관리한다.
-2. 승인 후 Collaboration Branch에 Merge하고 **Publish**하여 개발 Live Factory에
-   반영한다.
-3. Test/Production은 Publish 산출 ARM Template을 CI/CD로 배포한다.
-4. Function이 관리 API로 만든 Pipeline은 Live Factory에 바로 생성되고 Git에
-   자동 기록되지 않는다.
-5. 자동 생성 Pipeline의 Source of Truth는 Control Table, Function 버전,
-   Application Insights Audit로 정하고 사람이 직접 편집하지 않는다.
+### Scenario F - 동일 테이블 중복 Dispatcher
 
-모든 Pipeline을 반드시 Git 승인 대상으로 관리해야 한다면
-[Function 자동화 옵션](../../docs/function-automation-options.md)의 Bicep 정적
-Manifest 방식을 선택한다. 이 경우 Oracle Control Table 변경만으로 즉시 Pipeline이
-생성되지는 않는다.
+1. 같은 Dispatcher를 짧은 간격으로 두 번 시작한다.
+2. 같은 Control 행의 Claim과 Function 호출을 확인한다.
 
-## 구성 후 확인 자료
+기대 결과: 정상 재시도에서는 Storage Ledger 때문에 하나의 ADF Run만 생성된다.
+Create Run 직후 장애를 주입해 중복 Run이 생기더라도 Oracle Batch 실행 잠금 때문에
+실제 Count/Copy는 하나만 수행된다.
 
-다음 자료를 고객 환경의 구축 기록으로 남긴다.
+### Scenario G - Create Run 요청 실패
 
-1. Control Table 열과 샘플 행(접속 정보 제외)
-2. Oracle/ADLS Linked Service Test Connection
-3. 두 Parameter Dataset 설정
-4. 일반/대량 테이블 Pipeline Activity와 Partition 설정
-5. Function Identity와 ADF Custom Role
-6. 마스킹한 Function 환경 변수 목록
-7. Sync/Run Invocation 및 Application Insights 로그
-8. ADF Pipeline Run ID와 Activity Output
-9. Control Table의 Dispatch/Backoff 추적값
+1. Function의 ADF 권한을 테스트 범위에서 임시 제거한다.
+2. 임계치 충족 테이블을 실행한다.
+3. 권한 복구 후 Lease/Backoff 정책에 따라 재실행한다.
+
+기대 결과: 성공 Watermark는 이동하지 않으며 오류와 Failure Count가 기록되고,
+복구 후 같은 Pending 범위를 재제출한다.
+
+### Scenario H - Copy 또는 Count 불일치
+
+1. 테스트 Pipeline에서 Expected Rows와 다른 결과를 만들도록 구성한다.
+2. Pipeline 실패와 Control 상태를 확인한다.
+
+기대 결과: `LAST_SUCCESS_*`가 변경되지 않고 재실행 가능한 Pending 범위가 남는다.
+
+### Scenario I - NUMBER Watermark
+
+1. 증가형 숫자 PK 테이블을 등록한다.
+2. 경계값과 그 사이 행을 추가한다.
+3. Count와 Copy 조건이 `old < key <= new`인지 확인한다.
+
+기대 결과: 경계 중복·누락이 없다.
+
+### Scenario J - TIMESTAMP + PK Watermark
+
+1. 같은 수정일시를 가진 여러 행을 서로 다른 숫자 PK로 준비한다.
+2. 두 번에 걸쳐 적재한다.
+
+기대 결과: Timestamp 동률 행이 PK Tie-breaker로 모두 한 번씩 적재된다.
+
+## 11. 배포 후 수집할 증적
+
+1. Self-hosted IR Node 상태와 Oracle Linked Service Test Connection
+2. Dispatcher Run ID와 페이지별 Lookup 행 수
+3. 5,000행 초과 테스트의 전체 Control ID 대조 결과
+4. 임계치 미달 시 Function 미호출 증적
+5. Claim된 old/new Watermark와 Expected Rows
+6. Function 요청 Correlation ID와 ADF Run ID
+7. Count, rowsRead, rowsCopied 비교
+8. 성공/실패 후 Control Table 상태
+9. 중복 Dispatcher에서 단일 Run이 생성된 결과
+10. Azure Monitor Alert와 이메일 수신 결과
+
+## 12. 다음 단계
+
+이 문서 승인 후 다음 순서로 구현한다.
+
+1. Control Table과 Oracle Dispatch Package
+2. Function HTTP Endpoint와 Watermark Pipeline Factory
+3. Page Worker와 Dispatcher ADF JSON
+4. Schedule Trigger JSON
+5. 단위/정적 테스트
+6. 개발 환경 통합 테스트
+7. [Scenario 02 알림](../02-email-alerting/README.md) 연계 검증
 
 ## 공식 참고자료
 
-- [Lookup Activity 제한](https://learn.microsoft.com/azure/data-factory/control-flow-lookup-activity)
-- [Metadata-driven Copy](https://learn.microsoft.com/azure/data-factory/copy-data-tool-metadata-driven)
-- [ADF Source Control](https://learn.microsoft.com/azure/data-factory/source-control)
-- [ADF CI/CD](https://learn.microsoft.com/azure/data-factory/continuous-integration-delivery)
-- [ADF ARM Trigger 매개변수화](https://learn.microsoft.com/azure/data-factory/continuous-integration-delivery-resource-manager-custom-parameters)
+- [Lookup Activity 제한](https://learn.microsoft.com/azure/data-factory/control-flow-lookup-activity#supported-capabilities)
+- [ForEach 제한](https://learn.microsoft.com/azure/data-factory/control-flow-for-each-activity#limitations-and-workarounds)
+- [Script Activity](https://learn.microsoft.com/azure/data-factory/transform-data-using-script)
+- [Self-hosted Integration Runtime](https://learn.microsoft.com/azure/data-factory/create-self-hosted-integration-runtime)
 - [Oracle Connector](https://learn.microsoft.com/azure/data-factory/connector-oracle)
+- [Web Activity](https://learn.microsoft.com/azure/data-factory/control-flow-web-activity)

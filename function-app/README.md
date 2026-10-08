@@ -1,5 +1,11 @@
 # ADF Pipeline Manager Function
 
+> **Legacy PoC 구현:** 이 코드는 Timer와 Oracle Cursor를 사용하는 이전 구조다.
+> 현재 목표인 공통 Schedule Trigger, Lookup Keyset Paging, Self-hosted IR,
+> Watermark Threshold Dispatcher는 아직 구현되지 않았다. 배포 전에
+> [목표 아키텍처](../docs/target-architecture.md)와
+> [Scenario 01](../scenarios/01-metadata-pipeline/README.md)을 검토한다.
+
 Python v2 Azure Function으로 Oracle Control Table에서 테이블 설정을 읽어 ADF
 Pipeline을 생성/갱신하고 실행을 요청한다.
 

@@ -1,5 +1,10 @@
 # Azure Function 기반 테이블별 Pipeline 생성·실행 요청 자동화
 
+> **Legacy 옵션 문서:** 아래 내용은 Function이 Oracle에 직접 연결하는 이전
+> Timer/Cursor 방식을 설명한다. 현재 목표 구조는 Function의 Oracle 연결을
+> 제거하고 ADF Dispatcher와 Self-hosted IR을 사용한다.
+> [목표 아키텍처](target-architecture.md)를 우선 적용한다.
+
 ## 요구사항
 
 - 테이블마다 독립 ADF Pipeline 리소스를 생성한다.
