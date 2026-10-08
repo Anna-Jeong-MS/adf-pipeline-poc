@@ -1,0 +1,6 @@
+.git*
+.venv/
+local.settings.json
+tests/
+__pycache__/
+*.pyc

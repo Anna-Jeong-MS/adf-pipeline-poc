@@ -1,0 +1,22 @@
+# Local Azure workflow state and deployment-specific identifiers
+.azure/
+
+# Raw evidence contains subscription IDs, resource IDs, public IPs, and run IDs.
+evidence/
+
+# Local infrastructure and deployment tooling are intentionally not published.
+infra/
+scripts/
+.checkov.yml
+meeting_logs.md
+
+# Local credentials and editor files
+.env
+*.pem
+*.key
+.vscode/
+function-app/local.settings.json
+function-app/.venv/
+function-app/.pytest_cache/
+**/__pycache__/
+*.pyc

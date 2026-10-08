@@ -1,0 +1,18 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AZURE_SUBSCRIPTION_ID": "<SUBSCRIPTION_ID>",
+    "ADF_RESOURCE_GROUP": "<RESOURCE_GROUP>",
+    "ADF_FACTORY_NAME": "<FACTORY_NAME>",
+    "ORACLE_DSN": "<HOST>:1521/<SERVICE_NAME>",
+    "ORACLE_USER": "<CONTROL_SCHEMA_USER>",
+    "ORACLE_PASSWORD": "<USE_A_KEY_VAULT_REFERENCE_IN_AZURE>",
+    "PIPELINE_SYNC_SCHEDULE": "0 0 2 * * *",
+    "PIPELINE_RUN_SCHEDULE": "0 * * * * *",
+    "MANAGEMENT_API_CONCURRENCY": "8",
+    "PIPELINE_SYNC_BATCH_SIZE": "100",
+    "MAX_PIPELINES_PER_SCHEDULE": "20"
+  }
+}
