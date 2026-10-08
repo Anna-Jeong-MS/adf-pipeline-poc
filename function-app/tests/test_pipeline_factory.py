@@ -35,10 +35,20 @@ def test_builds_table_specific_pipeline_with_dynamic_range() -> None:
     copy_activity = resource["properties"]["activities"][1]
     assert copy_activity["typeProperties"]["parallelCopies"] == 8
     assert (
+        copy_activity["typeProperties"]["source"]["partitionOptions"]
+        == "DynamicRange"
+    )
+    assert "partitionOption" not in copy_activity["typeProperties"]["source"]
+    assert (
         copy_activity["typeProperties"]["source"]["partitionSettings"][
             "partitionColumnName"
         ]
         == "COST_ID"
+    )
+    count_activity = resource["properties"]["activities"][0]
+    assert count_activity["typeProperties"]["source"]["oracleReaderQuery"] == (
+        "SELECT COUNT(*) AS SOURCE_COUNT FROM GS_POC.GS_COST_ACTUALS "
+        "WHERE COST_ID >= 1 AND COST_ID <= 10000000"
     )
 
 
@@ -60,7 +70,7 @@ def test_rejects_unsafe_oracle_identifier() -> None:
         pipeline_resource(config)
 
 
-def test_tracking_failure_does_not_release_successful_run(monkeypatch) -> None:
+def test_tracking_failure_does_not_release_submitted_run(monkeypatch) -> None:
     config = TableConfig(
         control_id=3,
         source_schema="GS_POC",
@@ -92,7 +102,7 @@ def test_tracking_failure_does_not_release_successful_run(monkeypatch) -> None:
         tracking_calls.append((control_id, run_id))
         raise RuntimeError("Oracle tracking unavailable")
 
-    monkeypatch.setattr(function_app, "record_run_success", fail_tracking)
+    monkeypatch.setattr(function_app, "record_run_submission", fail_tracking)
     monkeypatch.setattr(
         function_app,
         "record_run_failure",

@@ -136,7 +136,7 @@ def claim_due_table_configs(limit: int) -> list[TableConfig]:
             return configs
 
 
-def record_run_success(control_id: int, run_id: str) -> None:
+def record_run_submission(control_id: int, run_id: str) -> None:
     with oracledb.connect(
         user=required_setting("ORACLE_USER"),
         password=required_setting("ORACLE_PASSWORD"),
@@ -210,7 +210,7 @@ def pipeline_resource(config: TableConfig) -> dict:
     source = {
         "type": "OracleSource",
         "queryTimeout": "02:00:00",
-        "partitionOption": config.partition_option,
+        "partitionOptions": config.partition_option,
     }
     copy_properties = {
         "source": source,
@@ -223,24 +223,35 @@ def pipeline_resource(config: TableConfig) -> dict:
         "parallelCopies": config.parallel_copies,
     }
 
+    source_count_query = f"SELECT COUNT(*) AS SOURCE_COUNT FROM {schema}.{table}"
     if config.partition_option == "DynamicRange":
         if not config.partition_column:
             raise ValueError(
                 f"DynamicRange requires PARTITION_COLUMN: {schema}.{table}"
             )
+        partition_column = validate_identifier(
+            config.partition_column, "PARTITION_COLUMN"
+        )
         source["partitionSettings"] = {
-            "partitionColumnName": validate_identifier(
-                config.partition_column, "PARTITION_COLUMN"
-            )
+            "partitionColumnName": partition_column
         }
+        count_predicates = []
         if config.partition_lower_bound is not None:
             source["partitionSettings"]["partitionLowerBound"] = str(
                 config.partition_lower_bound
+            )
+            count_predicates.append(
+                f"{partition_column} >= {config.partition_lower_bound}"
             )
         if config.partition_upper_bound is not None:
             source["partitionSettings"]["partitionUpperBound"] = str(
                 config.partition_upper_bound
             )
+            count_predicates.append(
+                f"{partition_column} <= {config.partition_upper_bound}"
+            )
+        if count_predicates:
+            source_count_query += " WHERE " + " AND ".join(count_predicates)
 
     dataset_parameters = {
         "schemaName": schema,
@@ -265,10 +276,7 @@ def pipeline_resource(config: TableConfig) -> dict:
                     "typeProperties": {
                         "source": {
                             "type": "OracleSource",
-                            "oracleReaderQuery": (
-                                f"SELECT COUNT(*) AS SOURCE_COUNT FROM "
-                                f"{schema}.{table}"
-                            ),
+                            "oracleReaderQuery": source_count_query,
                             "queryTimeout": "02:00:00",
                         },
                         "dataset": {
@@ -360,7 +368,7 @@ def pipeline_resource(config: TableConfig) -> dict:
                                             "firstRow.SOURCE_COUNT, ', copied=', "
                                             "activity('CopyToAdls').output."
                                             "rowsCopied, "
-                                            f"', partitionOption="
+                                            f"', partitionOptions="
                                             f"{config.partition_option}, "
                                             f"lower={config.partition_lower_bound}, "
                                             f"upper={config.partition_upper_bound}')"
@@ -467,7 +475,7 @@ def start_pipeline(config: TableConfig) -> tuple[str, str]:
             )
         raise
     try:
-        record_run_success(config.control_id, run_id)
+        record_run_submission(config.control_id, run_id)
     except Exception:
         logging.exception(
             "Pipeline %s started as run %s, but tracking update failed",

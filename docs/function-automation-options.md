@@ -1,11 +1,11 @@
-# Azure Function 기반 테이블별 Pipeline 자동화
+# Azure Function 기반 테이블별 Pipeline 생성·실행 요청 자동화
 
 ## 요구사항
 
 - 테이블마다 독립 ADF Pipeline 리소스를 생성한다.
 - 한 테이블의 대량 행은 Oracle 병렬 읽기로 처리한다.
-- PowerShell이 아니라 Azure Function Timer가 Pipeline 생성과 실행을 자동화한다.
-- 수백 개 Pipeline을 동시에 시작해 Oracle에 부하를 주지 않도록 제한한다.
+- Azure Function Timer가 Pipeline 생성·갱신과 Create Run 요청을 자동화한다.
+- 한 Timer 호출에서 제출할 Pipeline 수를 제한한다.
 
 ## 공통 전제
 
@@ -20,7 +20,7 @@ Function Managed Identity에는 대상 Data Factory 범위의 Pipeline 생성/�
 실행 권한이 필요하다. Oracle 암호는 Function App Setting에 Key Vault Reference로
 설정하고 소스 코드나 `local.settings.json`에 저장하지 않는다.
 
-최소 Custom Role에는 환경에 따라 다음 Data Action이 필요하다.
+최소 Custom Role의 `Actions`에는 환경에 따라 다음 관리 작업이 필요하다.
 
 ```text
 Microsoft.DataFactory/factories/pipelines/read
@@ -54,9 +54,9 @@ Oracle ADF_CONTROL_TABLE
 ### 장점
 
 - 신규 테이블이 Control Table에 등록되면 다음 Sync 주기에 Pipeline이 자동 생성된다.
-- 테이블별 `partitionOption`, `partitionColumn`, `parallelCopies`를 적용할 수 있다.
+- 테이블별 `partitionOptions`, `partitionColumnName`, `parallelCopies`를 적용할 수 있다.
 - 수백 Pipeline을 사람이 만들지 않아도 된다.
-- ADF Studio Publish나 PowerShell Trigger Start가 필요 없다.
+- 런타임 생성 방식에서는 ADF Studio Publish나 Trigger Start가 필요 없다.
 
 ### 단점
 
@@ -167,13 +167,18 @@ Timer 호출에서 나머지 예정 행을 계속 처리한다. Create Run이 �
 동시에 실행 중인 Pipeline 수를 엄격하게 제한하려면 Durable Functions로 Batch
 완료 후 다음 Batch를 실행하는 오케스트레이션을 추가한다.
 
-각 생성 Pipeline은 `concurrency: 1`로 설정되어 동일 테이블의 중복 실행을 막는다.
+각 생성 Pipeline은 `concurrency: 1`로 설정되어 동일 테이블의 동시 실행을
+제한한다. 중복 Create Run 요청을 제거하지는 않으며 후속 Run이 대기할 수 있다.
 
 Claim은 Run 제출 전에 다음 예정 시각을 갱신하는 at-most-once 방식이다. Function
 Host가 Claim 커밋 직후 종료되면 해당 실행이 다음 주기까지 지연될 수 있다. 반대로
 Create Run 성공 직후 추적 업데이트가 실패해도 Claim을 즉시 해제하지 않아 이미
 시작된 Run을 바로 중복 제출하지 않는다. 엄격한 전달 보장이 필요하면 Durable
 Functions와 별도 Dispatch 상태/Lease를 사용한다.
+
+`LAST_RUN_ID`와 `FAILURE_COUNT` 갱신은 Create Run API 요청의 접수 성공/실패를
+기록한다. ADF Pipeline의 최종 성공/실패를 조회하거나 실행 후 실패를 재처리하는
+기능은 이 샘플에 포함되지 않는다.
 
 ## Function 설정
 
@@ -191,10 +196,12 @@ Functions와 별도 Dispatch 상태/Lease를 사용한다.
 | `PIPELINE_SYNC_BATCH_SIZE` | Oracle Cursor에서 한 번에 읽을 Pipeline 설정 수 |
 | `MAX_PIPELINES_PER_SCHEDULE` | 한 실행에서 시작할 Pipeline 최대 수 |
 
-## Control Table이 ADF Lookup 제한보다 큰 경우
+## Control Table 조회 결과가 ADF Lookup 제한보다 큰 경우
 
-Function 기반 설계는 ADF Lookup Activity를 사용하지 않는다. 따라서 Lookup의
-5,000행/4MB 제한과 무관하게 Oracle Cursor를 직접 읽는다.
+Lookup 제한은 원천 테이블 데이터량이 아니라 Control Table 조회 결과에 적용된다.
+조회 결과가 5,000행/4MB 이내이고 ADF 내부 실행 제어로 충분하면 Lookup + ForEach도
+사용할 수 있다. 이 샘플은 제한 초과 가능성과 Claim/Backoff 요구 때문에 Oracle
+Cursor를 직접 읽는다.
 
 Pipeline 동기화 Function은 다음 방식으로 처리한다.
 
@@ -238,3 +245,4 @@ Control Table 행 수가 매우 커지면 Pipeline 정의를 매 Sync마다 전�
 - [ADF Pipeline Create or Update API](https://learn.microsoft.com/rest/api/datafactory/pipelines/create-or-update)
 - [ADF Pipeline Create Run API](https://learn.microsoft.com/rest/api/datafactory/pipelines/create-run)
 - [ADF Oracle 병렬 Copy](https://learn.microsoft.com/azure/data-factory/connector-oracle#parallel-copy-from-oracle)
+- [ADF ARM Trigger 매개변수화](https://learn.microsoft.com/azure/data-factory/continuous-integration-delivery-resource-manager-custom-parameters)

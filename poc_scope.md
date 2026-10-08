@@ -1,19 +1,19 @@
-# Oracle-ADF 메타데이터 Pipeline 자동화 PoC 범위
+# Oracle-ADF 메타데이터 Pipeline 생성·실행 요청 자동화 PoC 범위
 
 ## 목표
 
 Oracle Control Table을 Source of Truth로 사용해 공통 Copy/검증 템플릿을 테이블별
-독립 ADF Pipeline으로 자동 생성하고, Azure Function Timer로 실행한다. Azure
-Monitor를 이용해 Pipeline 성공/실패 이메일 알림도 구성한다.
+독립 ADF Pipeline으로 생성·갱신하고, Azure Function Timer로 실행을 요청한다.
+Azure Monitor를 이용한 Pipeline 성공/실패 이메일 알림 구성도 안내한다.
 
 ## 시나리오
 
-### 1. 메타데이터 기반 공통 Pipeline 설계 및 전체 자동화
+### 1. 메타데이터 기반 Pipeline 생성·실행 요청 자동화
 
 - Control Table과 공통 Pipeline 활동 구조 설계
 - Lookup 제한을 고려한 Function Cursor 배치 조회
-- 테이블별 Pipeline Create/Update 및 Create Run 자동화
-- 대량 테이블 Partition Copy와 실행량 제한
+- 테이블별 Pipeline Create/Update 및 Create Run 요청 자동화
+- 대량 테이블 Partition Copy와 Timer 호출당 제출량 제한
 
 [Scenario 01 단계별 가이드](scenarios/01-metadata-pipeline/README.md)
 

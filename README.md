@@ -1,8 +1,8 @@
 # Table-specific Oracle to ADLS ADF Pipeline Automation
 
 Oracle Control Table을 기준으로 공통 Pipeline 템플릿을 **테이블마다 독립적인
-Azure Data Factory Pipeline으로 자동 생성하고 실행**하는 Azure Function
-샘플입니다.
+Azure Data Factory Pipeline으로 자동 생성·갱신하고 실행을 요청**하는 Azure
+Function 샘플입니다.
 
 대량 테이블은 Pipeline을 분리하는 것에 더해 Oracle `DynamicRange` 또는 물리
 파티션 병렬 Copy와 `parallelCopies`를 테이블별로 설정합니다.
@@ -23,8 +23,9 @@ Oracle ADF_CONTROL_TABLE
                        +--> ValidateRowCount
 ```
 
-PowerShell이나 ADF Schedule Trigger는 실행 스케줄에 사용하지 않습니다. Azure
-Function Timer Trigger가 Pipeline 정의 동기화와 실행을 담당합니다.
+ADF Schedule Trigger도 ARM Template으로 Export·배포할 수 있다. 이 샘플은
+메타데이터 기반 Pipeline 동기화와 실행 일정 관리를 한 구성 요소에서 처리하기 위해
+Azure Function Timer Trigger를 선택했다.
 
 ## 자동화 옵션
 
@@ -52,7 +53,7 @@ scenarios/               고객이 따라 할 수 있는 시나리오별 구성 
 
 ## PoC 시나리오
 
-1. [메타데이터 기반 공통 Pipeline 설계 및 전체 자동화](scenarios/01-metadata-pipeline/README.md)
+1. [메타데이터 기반 Pipeline 생성·실행 요청 자동화](scenarios/01-metadata-pipeline/README.md)
 2. [Azure Portal Pipeline 이메일 알림 구성](scenarios/02-email-alerting/README.md)
 
 ## Function 샘플 실행
@@ -103,7 +104,8 @@ Azure에서는 `ORACLE_PASSWORD` App Setting에 Key Vault Reference를 사용합
 | `PARTITION_UPPER_BOUND` | 분할 최댓값 |
 | `PARALLEL_COPIES` | 한 테이블 내부 병렬 Copy 수 |
 
-Pipeline마다 `concurrency: 1`을 적용해 동일 테이블의 중복 실행을 막습니다.
+Pipeline마다 `concurrency: 1`을 적용해 동일 테이블의 동시 실행을 제한합니다.
+중복 Create Run 요청 자체를 제거하는 것은 아니며 추가 요청은 대기할 수 있습니다.
 수백 개 Pipeline을 동시에 시작하지 않도록 실행 그룹 또는 Durable Functions
 배치 오케스트레이션을 운영 설계에 추가해야 합니다.
 
@@ -121,6 +123,6 @@ Control Table이 ADF Lookup의 5,000행/4MB 제한을 넘더라도 Function은 A
 - Azure Monitor 성공/실패 Alert 발화
 
 이 저장소는 Portal, SQL, Pipeline 구조, Function 설정, KQL 샘플을 포함한 고객
-구성 가이드를 제공합니다. 새로운 Function 기반 테이블별 Pipeline 생성과 대용량
-Partition Copy는 코드 및 단위 테스트까지 제공하며, 고객 환경에서는 시나리오의
-확인 절차에 따라 통합 실행과 증적을 별도로 남겨야 합니다.
+구성 가이드를 제공합니다. Function 샘플은 Pipeline 생성·갱신과 실행 요청 접수
+까지만 추적하며 최종 실행 결과 기반 재처리와 전역 동시 실행 제한은 구현하지
+않습니다. 대용량 Partition Copy와 함께 고객 환경에서 통합 검증해야 합니다.

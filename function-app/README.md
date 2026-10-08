@@ -1,14 +1,14 @@
 # ADF Pipeline Manager Function
 
 Python v2 Azure Function으로 Oracle Control Table에서 테이블 설정을 읽어 ADF
-Pipeline을 생성/갱신하고 실행한다.
+Pipeline을 생성/갱신하고 실행을 요청한다.
 
 ## Functions
 
 | Function | Trigger | 역할 |
 |---|---|---|
 | `sync_table_pipelines` | Timer | 테이블별 Pipeline Create/Update |
-| `run_table_pipelines` | Timer | 테이블별 Pipeline Create Run |
+| `run_table_pipelines` | Timer | 테이블별 Pipeline Create Run 요청 |
 
 Pipeline 동기화는 ADF Lookup 대신 Oracle Cursor `fetchmany`를 사용하므로 Lookup의
 5,000행/4MB 제한을 받지 않는다. 실행 Timer는 예정된 행만 `SKIP LOCKED`로 Claim한다.
@@ -37,6 +37,6 @@ pytest
 ## 주의 사항
 
 샘플 `run_table_pipelines`는 `NEXT_RUN_AT_UTC`가 지난 행을 최대 설정 개수만큼
-Claim해 여러 Timer 주기에 걸쳐 빠짐없이 제출한다. 다만 Pipeline 완료까지 기다려
-전역 동시성을 제어하지는 않는다. 수백 개 대용량 테이블 운영에서는 Durable
-Functions로 Batch 완료를 기다린 후 다음 Batch를 시작하도록 확장한다.
+Claim해 Create Run을 요청한다. 기록하는 Run ID는 요청 접수 결과이며 Pipeline
+최종 성공을 의미하지 않는다. Pipeline 완료 기반 재처리와 전역 동시성 제어가
+필요하면 Durable Functions 및 Dispatch 상태/Lease를 추가한다.

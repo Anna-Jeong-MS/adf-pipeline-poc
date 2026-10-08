@@ -1,9 +1,9 @@
-# Scenario 01 - 메타데이터 기반 공통 Pipeline 설계 및 전체 자동화
+# Scenario 01 - 메타데이터 기반 Pipeline 생성·실행 요청 자동화
 
 이 문서는 Oracle Control Table의 메타데이터로 동일한 ADF Copy 구조를 반복
-적용하고, Azure Function이 테이블별 Pipeline 생성과 실행을 자동화하는 방법을
-설명한다. 가능 여부를 판정하는 문서가 아니라 고객이 직접 구성하는 단계별
-가이드다.
+적용하고, Azure Function이 테이블별 Pipeline 생성·갱신과 실행 요청을 자동화하는
+방법을 설명한다. 가능 여부를 판정하는 문서가 아니라 고객이 직접 구성하는
+단계별 가이드다.
 
 ## 1.1 Pipeline 설계 아키텍처
 
@@ -36,12 +36,13 @@ Control Table 한 행마다 이 템플릿으로 독립 Pipeline을 만들어 테
 
 | 방식 | 적용 기준 | 메타데이터 읽기 |
 |---|---|---|
-| ADF Lookup + ForEach | 활성 행이 항상 5,000개 미만이고 출력이 4MB 미만인 소규모 환경 | `Lookup.output.value` |
-| Function Cursor 배치 | 수백~수천 테이블, 행 증가 가능성, API 호출 제어 필요 | Oracle `fetchmany` |
+| ADF Lookup + ForEach | Control Table 조회 결과가 5,000행/4MB 이내이고 ADF 내부 제어로 충분 | `Lookup.output.value` |
+| Function Cursor 배치 | 제한 초과 가능성 또는 Claim, Backoff, API 호출 제어 필요 | Oracle `fetchmany` |
 
-ADF Lookup은 최대 5,000행만 반환하고 출력은 4MB를 넘을 수 없다. 따라서 운영
-가이드의 기본은 Function Cursor 배치이며, Pipeline 안의 `GetSourceCount` Lookup은
-`COUNT(*)` 한 행만 반환하므로 이 제한과 무관하다.
+ADF Lookup 제한은 원천 테이블 데이터량이 아니라 Control Table 조회 결과에
+적용된다. 테이블이 수백 개여도 결과가 5,000행/4MB 이내이고 별도 Claim 제어가
+필요하지 않다면 Lookup + ForEach를 사용할 수 있다. Pipeline 안의
+`GetSourceCount` Lookup은 `COUNT(*)` 한 행만 반환하므로 이 제한과 무관하다.
 
 Lookup + ForEach로 구성하는 경우:
 
@@ -165,7 +166,8 @@ where SOURCE_SCHEMA = 'GS_POC'
 commit;
 ```
 
-Bound는 Copy 범위를 제한하므로 신규 키가 Upper Bound를 넘기 전에 갱신한다.
+Oracle Connector 문서상 Bound는 복사할 Partition Column의 최솟값과 최댓값이다.
+신규 키가 Upper Bound를 넘기 전에 갱신하고 Row Count도 동일 범위로 조회한다.
 `PARALLEL_COPIES`는 4부터 시작해 Oracle Session, CPU, I/O를 확인하며 조정한다.
 
 ### 1.1.7 공통 Pipeline 템플릿
@@ -188,17 +190,22 @@ Bound는 Copy 범위를 제한하므로 신규 키가 Upper Bound를 넘기 전�
 }
 ```
 
-- `GetSourceCount`: `SELECT COUNT(*)` 한 행 조회
+- `GetSourceCount`: Dynamic Range 사용 시 같은 Lower/Upper Bound 조건의
+  `SELECT COUNT(*)` 한 행 조회
 - `CopyToAdls`: Dataset Parameter와 Control Table의 Partition 설정 적용
 - `ValidateRowCount`: Lookup Count와 `CopyToAdls.output.rowsCopied` 비교
 - 불일치: `ROW_COUNT_MISMATCH` 코드로 Fail Activity 실행
-- `concurrency: 1`: 같은 테이블 Pipeline의 중복 동시 실행 방지
+- `concurrency: 1`: 같은 테이블 Pipeline의 동시 실행 제한
+
+Count와 Copy 사이에 원천 데이터가 변경되면 정상 Copy도 불일치로 판단될 수 있다.
+이 검증은 행 수만 비교하며 컬럼 값의 동일성을 보장하지 않는다. 운영에서는
+Watermark/SCN 또는 적재가 고정된 Partition을 사용해 동일 데이터 시점을 맞춘다.
 
 정확한 생성 로직과 Dynamic Range JSON은
 [function_app.py](../../function-app/function_app.py)의 `pipeline_resource`를
 사용한다. 테이블/Schema/Partition 열은 식별자 검증 후 JSON에 반영된다.
 
-## 1.2 전체 Pipeline 자동화
+## 1.2 Pipeline 생성·갱신 및 실행 요청 자동화
 
 ### 1.2.1 자동화 방식
 
@@ -207,11 +214,13 @@ Bound는 Copy 범위를 제한하므로 신규 키가 Upper Bound를 넘기 전�
 | Function | 기본 역할 |
 |---|---|
 | `sync_table_pipelines` | Control Table을 배치 조회해 Pipeline Create/Update |
-| `run_table_pipelines` | 예정 행을 Claim하고 Pipeline Create Run |
+| `run_table_pipelines` | 예정 행을 Claim하고 Pipeline Create Run 요청 |
 
-ADF Schedule Trigger나 배포 PowerShell은 사용하지 않는다. 신규 Control Table 행은
-다음 Sync 주기에 Pipeline으로 생성되고, `NEXT_RUN_AT_UTC`가 지난 행은 Run Timer가
-제한된 개수만 제출한다.
+ADF Schedule Trigger는 Factory ARM Template으로 Export·배포할 수 있고
+`recurrence`도 매개변수화할 수 있다. 이 샘플은 Export 제한 때문이 아니라
+메타데이터 동기화와 실행 일정·Claim을 한 구성 요소에서 관리하기 위해 Function
+Timer를 선택했다. 신규 Control Table 행은 다음 Sync 주기에 Pipeline으로 생성되고,
+`NEXT_RUN_AT_UTC`가 지난 행은 Run Timer가 제한된 개수만 제출한다.
 
 ### 1.2.2 Function App 배포
 
@@ -237,7 +246,8 @@ pytest
 
 1. Function App의 **Settings > Identity > System assigned**를 **On**으로 저장한다.
 2. Data Factory의 **Access control (IAM) > Add role assignment**를 연다.
-3. 다음 Action만 포함한 조직 Custom Role을 Factory Scope에 부여한다.
+3. 다음 관리 작업을 `Actions`에 포함한 조직 Custom Role을 Factory Scope에
+   부여한다.
 
 ```text
 Microsoft.DataFactory/factories/pipelines/read
@@ -287,7 +297,7 @@ traces
 | order by timestamp desc
 ```
 
-### 1.2.6 Pipeline 실행 자동화 확인
+### 1.2.6 Pipeline 실행 요청 확인
 
 테스트 행의 실행 시각을 현재로 바꾼다.
 
@@ -314,6 +324,15 @@ commit;
 - 제출 실패는 `FAILURE_COUNT`, `LAST_ERROR`에 기록하고 최대 60분 Backoff한다.
 - 전체 동시 실행 수를 완료 기준으로 엄격히 제한하려면 Durable Functions에서
   Batch 완료를 기다린 후 다음 Batch를 제출하도록 확장한다.
+
+현재 구현의 정확한 범위:
+
+- `LAST_RUN_ID`는 Create Run API가 요청을 접수한 Run ID이며 최종 성공 기록이 아니다.
+- 실행 제출 실패는 Backoff하지만 제출 후 Pipeline 실패를 추적·재처리하지 않는다.
+- `MAX_PIPELINES_PER_SCHEDULE`은 Timer 한 번의 제출 수이며 전역 동시 실행 상한이 아니다.
+- `concurrency: 1`은 동시 실행을 제한하지만 중복 요청 자체를 제거하지 않는다.
+- Claim 직후 Host가 종료되면 해당 회차가 지연될 수 있으므로 엄격한 복구에는
+  Dispatch 상태와 Lease가 필요하다.
 
 ### 1.2.8 Git Mode와 Live Mode 운영
 
@@ -352,3 +371,5 @@ Manifest 방식을 선택한다. 이 경우 Oracle Control Table 변경만으로
 - [Metadata-driven Copy](https://learn.microsoft.com/azure/data-factory/copy-data-tool-metadata-driven)
 - [ADF Source Control](https://learn.microsoft.com/azure/data-factory/source-control)
 - [ADF CI/CD](https://learn.microsoft.com/azure/data-factory/continuous-integration-delivery)
+- [ADF ARM Trigger 매개변수화](https://learn.microsoft.com/azure/data-factory/continuous-integration-delivery-resource-manager-custom-parameters)
+- [Oracle Connector](https://learn.microsoft.com/azure/data-factory/connector-oracle)
